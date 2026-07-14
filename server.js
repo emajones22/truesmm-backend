@@ -640,6 +640,137 @@ app.post('/api/order', async (req, res) => {
   }
 });
 
+// ---- Detect panel currency and obtain a current INR conversion rate ----
+// Most standard SMM APIs expose account currency through action=balance.
+const ISO_CURRENCY_RE = /^[A-Z]{3}$/;
+const exchangeRateCache = new Map();
+
+function normalizeCurrency(value) {
+  const raw = String(value || '').trim();
+  const code = raw.toUpperCase();
+  const aliases = {
+    '$': 'USD', 'US$': 'USD', USDOLLAR: 'USD', DOLLAR: 'USD', DOLLARS: 'USD',
+    '₹': 'INR', RS: 'INR', 'RS.': 'INR', RUPEE: 'INR', RUPEES: 'INR',
+    '€': 'EUR', EURO: 'EUR', EUROS: 'EUR',
+    '£': 'GBP', POUND: 'GBP', POUNDS: 'GBP',
+    '₽': 'RUB', RUBLE: 'RUB', RUBLES: 'RUB',
+    '₺': 'TRY', LIRA: 'TRY',
+    '৳': 'BDT', TAKA: 'BDT',
+  };
+  return aliases[code] || (ISO_CURRENCY_RE.test(code) ? code : null);
+}
+
+function extractPanelCurrency(body) {
+  const candidates = [
+    body?.currency, body?.currency_code, body?.currencyCode,
+    body?.data?.currency, body?.data?.currency_code,
+    body?.account?.currency, body?.user?.currency,
+  ];
+  for (const candidate of candidates) {
+    const normalized = normalizeCurrency(candidate);
+    if (normalized) return normalized;
+  }
+  return null;
+}
+
+function validateProviderUrl(value) {
+  try {
+    const parsed = new URL(String(value || '').trim());
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:' ? parsed.toString() : null;
+  } catch { return null; }
+}
+
+async function getInrExchangeRate(currency) {
+  if (currency === 'INR') return { rate: 1, updatedAt: new Date().toISOString() };
+  const cached = exchangeRateCache.get(currency);
+  if (cached && Date.now() - cached.fetchedAt < 6 * 60 * 60 * 1000) return cached;
+
+  try {
+    const response = await axios.get(`https://open.er-api.com/v6/latest/${encodeURIComponent(currency)}`, {
+      timeout: 15_000,
+      validateStatus: () => true,
+    });
+    const rate = Number(response.data?.rates?.INR);
+    if (response.status < 200 || response.status >= 300 || !Number.isFinite(rate) || rate <= 0) {
+      throw new Error(`INR exchange rate is unavailable for ${currency}`);
+    }
+    const parsedUpdateTime = Date.parse(response.data?.time_last_update_utc || '');
+    const result = {
+      rate,
+      updatedAt: Number.isFinite(parsedUpdateTime)
+        ? new Date(parsedUpdateTime).toISOString()
+        : new Date().toISOString(),
+      fetchedAt: Date.now(),
+    };
+    exchangeRateCache.set(currency, result);
+    return result;
+  } catch (e) {
+    // A temporarily unavailable FX provider should not break pricing if this
+    // process has a previously verified rate. The original timestamp is kept.
+    if (cached?.rate > 0) {
+      warn(`Using stale cached ${currency}/INR rate:`, e?.message || e);
+      return cached;
+    }
+    throw e;
+  }
+}
+
+app.post('/api/panel/pricing-meta', async (req, res) => {
+  const { apiUrl, apiKey } = req.body || {};
+  const requestedCurrency = normalizeCurrency(req.body?.currency);
+  const safeApiUrl = validateProviderUrl(apiUrl);
+  if (!safeApiUrl || !apiKey) return res.status(400).json({ error: 'Valid API URL and key are required' });
+
+  try {
+    let currency = requestedCurrency;
+    let currencySource = requestedCurrency ? 'user' : null;
+    let balance = null;
+
+    // Even when a user supplied a currency, fetch balance for useful validation.
+    try {
+      const params = new URLSearchParams({ key: String(apiKey), action: 'balance' });
+      const panelResponse = await axios.post(safeApiUrl, params.toString(), {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        timeout: PROVIDER_HTTP_TIMEOUT_MS,
+        validateStatus: () => true,
+      });
+      const body = panelResponse.data;
+      const detected = extractPanelCurrency(body);
+      const parsedBalance = Number(body?.balance ?? body?.data?.balance);
+      if (Number.isFinite(parsedBalance)) balance = parsedBalance;
+      if (!currency && detected) {
+        currency = detected;
+        currencySource = 'panel';
+      }
+    } catch (e) {
+      warn('Panel balance/currency detection failed:', e?.message || e);
+    }
+
+    if (!currency) {
+      return res.json({
+        currency: null,
+        currencySource: null,
+        exchangeRateToInr: null,
+        exchangeRateUpdatedAt: null,
+        balance,
+        requiresCurrencyConfirmation: true,
+      });
+    }
+
+    const exchange = await getInrExchangeRate(currency);
+    return res.json({
+      currency,
+      currencySource,
+      exchangeRateToInr: exchange.rate,
+      exchangeRateUpdatedAt: exchange.updatedAt,
+      balance,
+      requiresCurrencyConfirmation: false,
+    });
+  } catch (e) {
+    return res.status(502).json({ error: e?.message || 'Pricing metadata is unavailable' });
+  }
+});
+
 // ---- Fetch services from provider ----
 app.post('/api/services', async (req, res) => {
   const { apiUrl, apiKey } = req.body || {};
